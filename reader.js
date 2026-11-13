@@ -7,6 +7,7 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
   let baseWidth = 595, baseHeight = 842, scale = 1;
   let textCache = new Map(), results = [], resultsShown = 0;
   let searchSpec = null, selectedMatch = null, focusMatch = false;
+  let loadController, slowTimer, loadStarted = 0;
   const scroll = $('page-scroll');
   const pages = $('pdf-pages');
   const library = () => libPromise ||= import('./vendor/pdfjs/pdf.mjs').then((lib) => {
@@ -28,7 +29,29 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
     const text = document.createElement('div');
     text.textContent = message;
     $('reader-status').append(text);
+    if (busy && loadStarted && Date.now() - loadStarted >= 12000) {
+      const note = document.createElement('small');
+      note.textContent = '加载较慢，可以继续等待，或先用浏览器打开原文件。';
+      const original = document.createElement('a');
+      original.href = activeDoc.url;
+      original.target = '_blank';
+      original.rel = 'noopener';
+      original.textContent = '打开原文件 ↗';
+      note.append(document.createElement('br'), original);
+      $('reader-status').append(note);
+    }
     $('reader-status').hidden = false;
+  }
+  function waitForLoad(promise, milliseconds, stage) {
+    const signal = loadController.signal;
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); };
+      const abort = () => { cleanup(); reject(new DOMException('Loading cancelled', 'AbortError')); };
+      const timer = setTimeout(() => { cleanup(); reject(new Error(`TIMEOUT:${stage}`)); }, milliseconds);
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      Promise.resolve(promise).then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+    });
   }
   function controls() {
     const ready = Boolean(pdf && slots.length);
@@ -66,6 +89,9 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
     slot.page = null;
   }
   function clear() {
+    loadController?.abort();
+    clearTimeout(slowTimer);
+    loadStarted = 0;
     layoutVersion++;
     searchVersion++;
     observer?.disconnect();
@@ -87,6 +113,8 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
     const token = ++session;
     clear();
     activeDoc = doc;
+    loadController = new AbortController();
+    loadStarted = Date.now();
     currentPage = page;
     $('reader-title').textContent = `${doc.model} ${doc.title}`;
     $('reader-subtitle').textContent = `v${doc.version} · ${size(doc.bytes)}${isLatest(doc) ? '' : ' · 历史版本'}`;
@@ -99,24 +127,42 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
     $('find-more').hidden = $('find-stop').hidden = true;
     $('find-summary').textContent = '搜索当前文档正文，结果将显示在这里。';
     $('reader-footnote').textContent = '连续滚动 · 按需渲染';
-    status(`正在打开${doc.title}…`, true);
+    status('正在加载 PDF 阅读器…', true);
+    slowTimer = setTimeout(() => {
+      if (token === session && !slots.length) status('仍在加载阅读器或文档，请稍候…', true);
+    }, 12000);
     controls();
     if (!$('reader').open) $('reader').showModal();
     try {
       if (location.protocol === 'file:') throw new Error('LOCAL_FILE');
-      const lib = await library();
+      const lib = await waitForLoad(library(), 45000, '阅读器模块');
       if (token !== session) return;
+      status('正在初始化阅读器并连接 PDF…', true);
+      const smallDocument = doc.bytes <= 4 * 1024 * 1024;
       loadingTask = lib.getDocument({
         url: new URL(doc.url, document.baseURI).href,
         cMapUrl: new URL('./vendor/pdfjs/cmaps/', document.baseURI).href,
         cMapPacked: true,
         standardFontDataUrl: new URL('./vendor/pdfjs/standard_fonts/', document.baseURI).href,
-        isEvalSupported: false, disableAutoFetch: true, disableStream: true, rangeChunkSize: 65536,
+        isEvalSupported: false,
+        // Small documents load in one streaming request; large manuals retain
+        // range loading with fewer round trips on high-latency connections.
+        disableRange: smallDocument,
+        disableAutoFetch: !smallDocument,
+        disableStream: !smallDocument,
+        rangeChunkSize: 262144,
       });
-      const loaded = await loadingTask.promise;
+      loadingTask.onProgress = ({ loaded, total }) => {
+        if (token !== session || slots.length) return;
+        const expected = total || doc.bytes;
+        const percent = Math.min(100, Math.round(loaded / expected * 100));
+        status(`正在读取 PDF · ${size(loaded)} / ${size(expected)}（${percent}%）`, true);
+      };
+      const loaded = await waitForLoad(loadingTask.promise, 90000, 'PDF 下载或阅读器初始化');
       if (token !== session) return;
       pdf = loaded;
-      const first = await pdf.getPage(1);
+      status('正在解析 PDF 首页…', true);
+      const first = await waitForLoad(pdf.getPage(1), 45000, 'PDF 首页解析');
       if (token !== session) return;
       const viewport = first.getViewport({ scale: 1 });
       baseWidth = viewport.width;
@@ -131,6 +177,8 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
         pages.append(element);
       }
       $('reader-status').hidden = true;
+      clearTimeout(slowTimer);
+      loadStarted = 0;
       $('reader-footnote').textContent = `${doc.filename} · ${pdf.numPages} 页`;
       controls();
       onRead(doc);
@@ -140,7 +188,7 @@ window.createPdfReader = ({ docs, $, isLatest, size, onRead }) => {
       if (token !== session) return;
       clear();
       controls();
-      status(error.message === 'LOCAL_FILE' ? '请运行“一键预览.bat”，通过预览地址使用内置阅读器。' : '文档未能打开，请检查网络或点击右上角“打开原文件”。');
+      status(error.message === 'LOCAL_FILE' ? '请运行“一键预览.bat”，通过预览地址使用内置阅读器。' : error.message.startsWith('TIMEOUT:') ? `${error.message.slice(8)}超时。请重试或打开原文件；也可切换网络后重试。` : '文档未能打开，请检查网络或点击右上角“打开原文件”。');
       const retry = document.createElement('button');
       retry.className = 'primary-button';
       retry.textContent = '重新加载';
